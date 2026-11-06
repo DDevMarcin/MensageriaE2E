@@ -1,0 +1,90 @@
+================================================================================
+CORREÇÕES E PADRONIZAÇÕES NA DOCUMENTAÇÃO DE ESPECIFICAÇÃO
+================================================================================
+
+Este arquivo registra exclusivamente as correções de ambiguidades e incoerências
+aplicadas aos documentos de especificação em docs/ antes do início da codificação,
+mantendo o EXPLICACAO_SISTEMA.txt focado apenas na explicação do sistema em si.
+
+--------------------------------------------------------------------------------
+1. Organização da Estrutura de Diretórios (docs/, src/, test/, scripts/, certs/)
+--------------------------------------------------------------------------------
+- Problema identificado:
+  O arquivo AGENTS.md (§3, §6, §7) e o documento 07-estrutura-do-projeto.md (§1)
+  referenciavam os documentos de especificação dentro da pasta docs/, mas os
+  arquivos 01-*.md a 07-*.md estavam soltos na raiz do projeto.
+- Correção aplicada:
+  Criada a árvore de diretórios padrão referenciada em docs/07-estrutura-do-projeto.md
+  (docs/, scripts/, certs/, src/securechat/{common,server,client,tools},
+  test/securechat) e movidos os arquivos 01-*.md a 07-*.md para dentro de docs/.
+
+--------------------------------------------------------------------------------
+2. Padronização do Armazenamento da Chave RSA do Servidor (PKCS#12)
+--------------------------------------------------------------------------------
+- Problema identificado:
+  Em docs/01-especificacao-protocolo.md (§3 e §4), mencionava-se que a chave
+  privada RSA do servidor ficava em "server.key", enquanto docs/06-guia-java-21.md
+  (§5), docs/07-estrutura-do-projeto.md (§1) e docs/04-tasks.md (T03) definiam o
+  uso do keystore PKCS#12 em "certs/server.p12" (gerado via keytool) e o
+  certificado exportado em "certs/server.crt" (DER).
+- Correção aplicada:
+  Atualizado docs/01-especificacao-protocolo.md (§3, §4 e §10/D1) para referenciar
+  explicitamente "certs/server.p12" (PKCS#12) e "certs/server.crt" (DER).
+
+--------------------------------------------------------------------------------
+3. Não Bloqueio de Frames E2E por seqRecv Global na Sessão do Servidor
+--------------------------------------------------------------------------------
+- Problema identificado:
+  Em docs/02-estruturas-de-dados.md, a classe Session do servidor possui o campo
+  "long seqRecv = -1" com a nota de que o servidor opcionalmente poderia checar
+  o seq_no dos frames E2E no roteamento. Contudo, no cliente o contador seq_no E2E
+  é independente por par (remetente, destinatário). Se um cliente A enviasse a
+  primeira mensagem para B (seq_no = 0) e em seguida a primeira mensagem para C
+  (seq_no = 0), um contador seqRecv único na sessão de A no servidor rejeitaria
+  indevidamente a mensagem destinada a C.
+- Correção aplicada:
+  Atualizado docs/02-estruturas-de-dados.md esclarecendo que o campo seqRecv é
+  mantido na classe Session por compatibilidade com a estrutura de dados do
+  enunciado, mas o servidor NÃO bloqueia frames E2E usando um seqRecv global por
+  sessão; a verificação obrigatória de anti-replay (seq_no > seqRecv) ocorre no
+  cliente destinatário em PeerState.seqRecv.
+
+--------------------------------------------------------------------------------
+4. Fluxo Exato na Rejeição de client_id Duplicado Ativo (Decisão D4)
+--------------------------------------------------------------------------------
+- Problema identificado:
+  A especificação (D4) determinava rejeitar conexões com client_id já ativo com
+  uma mensagem ERROR, mas o opcode ERROR (0x05) trafega dentro de um frame
+  CONTROL (0x03) cifrado com Key_S2C. Não estava explícito em que ponto do
+  handshake o erro era enviado nem como proteger a sessão original na limpeza.
+- Correção aplicada:
+  Detalhado em docs/01-especificacao-protocolo.md (§4 passo 7, §9 e §10/D4) e em
+  docs/02-estruturas-de-dados.md que, após enviar HELLO_REPLY e derivar Key_S2C,
+  se SessionRegistry.register (putIfAbsent) detectar que o client_id já está
+  ativo, o servidor envia CONTROL(ERROR) cifrado com a Key_S2C da nova conexão e
+  fecha o novo socket sem remover a sessão existente nem enviar PEER_LEFT aos
+  demais clientes.
+
+--------------------------------------------------------------------------------
+5. Exclusão do Próprio Cliente em PEER_LIST (Passo 8 do Handshake)
+--------------------------------------------------------------------------------
+- Problema identificado:
+  Em docs/01-especificacao-protocolo.md (§4 passos 7 e 8), o servidor registrava
+  o cliente em sessions e em seguida enviava PEER_LIST. Não estava explícito se
+  o próprio cliente recém-conectado deveria ser filtrado de PEER_LIST.
+- Correção aplicada:
+  Especificado em docs/01-especificacao-protocolo.md (§4 passo 8) que PEER_LIST
+  enviada ao novo cliente contém apenas os demais peers ativos (excluindo o
+  próprio client_id recém-registrado) e que, por defesa em profundidade, o
+  cliente também ignora entradas com seu próprio client_id caso apareçam.
+
+--------------------------------------------------------------------------------
+6. Alinhamento da Lista de Decisões D1–D7 em docs/05-documentacao-explicativa.md
+--------------------------------------------------------------------------------
+- Problema identificado:
+  A seção 13 de docs/05-documentacao-explicativa.md mencionava apenas "D1–D5",
+  enquanto docs/01-especificacao-protocolo.md e docs/04-tasks.md listam D1 a D7.
+- Correção aplicada:
+  Corrigido o texto da seção 13 em docs/05-documentacao-explicativa.md para
+  "D1–D7 (e novas)".
+
