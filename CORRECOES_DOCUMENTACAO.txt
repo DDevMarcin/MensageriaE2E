@@ -88,3 +88,97 @@ mantendo o EXPLICACAO_SISTEMA.txt focado apenas na explicação do sistema em si
   Corrigido o texto da seção 13 em docs/05-documentacao-explicativa.md para
   "D1–D7 (e novas)".
 
+================================================================================
+ANÁLISE DO ENUNCIADO ORIGINAL (trabalho-pratico-3.pdf) VS. SOLUÇÕES DO PROJETO
+================================================================================
+
+Abaixo estão registradas as incoerências e incompatibilidades técnicas presentes
+no PDF original do trabalho prático e como a especificação (docs/01 a 07) e a
+implementação em Java 21 as solucionaram:
+
+--------------------------------------------------------------------------------
+7. Ambiguidade de pk_server / pk_S no Handshake (Págs. 1, 2, 3, 8 e 9 do PDF)
+--------------------------------------------------------------------------------
+- Incoerência no PDF:
+  Na pág. 2, o PDF define pk_server como a chave pública RSA distribuída dentro de
+  server.crt, mas na pág. 3 afirma que pk_server e pk_client em
+  H = SHA256(pk_server || pk_client || client_id || salt) são "raw bytes", na
+  pág. 1 diz que o certificado RSA assina a "chave efêmera ECDHE" e na pág. 8
+  envia pk_S separado de server.crt. Além disso, o PDF menciona mensagens de
+  controle s2c (págs. 4 e 5) sem explicitar como a chave desse canal é derivada.
+- Solução adotada (Decisão D1 — ServerHandshake / ClientHandshake):
+  pk_S (32 bytes raw) é a chave pública X25519 efêmera do servidor gerada a cada
+  conexão e assinada via RSA-PSS sobre H. A partir de ECDH(sk_S, pk_C) e HKDF
+  com info="S2C", servidor e cliente derivam Key_S2C (16 B) para cifrar o canal
+  administrativo de controle Servidor -> Cliente.
+
+--------------------------------------------------------------------------------
+8. Incompatibilidade do salt_srv no Acordo E2E (Págs. 2, 5, 8 e 9 do PDF)
+--------------------------------------------------------------------------------
+- Incoerência no PDF:
+  Cada cliente recebe seu próprio salt_srv (16 B) no handshake com o servidor
+  (pág. 2 e pág. 5). Porém, na pág. 8 (passos 5 e 6), o servidor envia apenas a
+  chave pública pk_C do peer (sem o salt), e na pág. 9 manda calcular
+  PRK = HKDF-Extract(salt_srv, Z_AB). Se o Cliente A usasse seu salt_srv_A e o
+  Cliente B usasse seu salt_srv_B, ambos obteriam PRKs e chaves AES diferentes.
+- Solução adotada (Decisão D2 — Messages / PeerState.derive):
+  O servidor envia [client_id (16B) || pk_C (32B) || salt_srv (16B)] em PEER_LIST
+  e PEER_JOINED, e ambos os clientes selecionam deterministicamente o salt_srv do
+  cliente de menor client_id (A = min unsigned de 16 bytes).
+
+--------------------------------------------------------------------------------
+9. Incompatibilidade de IV_base_recv = random(4B) (Págs. 4, 6, 7, 9 e 10 do PDF)
+--------------------------------------------------------------------------------
+- Incoerência no PDF:
+  Na pág. 9, o PDF manda inicializar na tabela peers de cada cliente
+  IV_base_send = random(4B) e IV_base_recv = random(4B), e na pág. 10 diz que o
+  destinatário "reconstrói nonce e decifra". Se cada lado sorteasse 4 bytes
+  aleatórios localmente sem sincronizá-los, IV_base_send de A nunca bateria com
+  IV_base_recv de B e 100% das decifragens AES-GCM falhariam. Ao mesmo tempo, na
+  pág. 4 o próprio PDF já inclui [nonce (12B)] completo no cabeçalho do frame E2E.
+- Solução adotada (Decisão D3 — PeerState.openMessage):
+  O nonce de 12 bytes (IV_base || seq_no) trafega no cabeçalho do frame E2E. No
+  1º frame E2E cuja tag GCM valida, o destinatário aprende os 4 primeiros bytes
+  do nonce e os fixa em ivBaseRecv, exigindo que todos os frames seguintes daquele
+  peer na mesma sessão mantenham o mesmo IV_base.
+
+--------------------------------------------------------------------------------
+10. Indefinição dos Papéis "A" e "B" em Multi-Cliente (Págs. 2, 6, 7 e 9 do PDF)
+--------------------------------------------------------------------------------
+- Incoerência no PDF:
+  O PDF diferencia Key_A2B (info="A2B") e Key_B2A (info="B2A"), mas não define
+  como dois clientes arbitrários identificados apenas por UUID v4 (16 bytes)
+  decidem quem é A e quem é B.
+- Solução adotada (ClientId.compareTo / PeerState.derive):
+  Definida comparação lexicográfica unsigned dos 16 bytes do client_id
+  (Arrays.compareUnsigned): no par, o menor client_id é sempre A e o maior é B.
+
+--------------------------------------------------------------------------------
+11. Conflito entre seq_recv Único no Servidor e seq_send por Par (Págs. 5, 6 e 11)
+--------------------------------------------------------------------------------
+- Incoerência no PDF:
+  Na pág. 5, sessions[client_id] tem um único contador seq_recv por cliente no
+  servidor, e a pág. 11 sugere que o servidor opcionalmente poderia checar seq_no
+  no roteamento. Contudo, nas págs. 6 e 7 o seq_send E2E é independente por par
+  destinatário (começa em 0 para B e em 0 para C), o que faria um seq_recv único
+  no servidor bloquear mensagens legítimas em cenários com 3 ou mais clientes.
+- Solução adotada (Session / ClientConnection / PeerState):
+  A checagem bloqueante de anti-replay E2E (seq_no > seqRecv) é executada no
+  cliente destinatário por par (PeerState), enquanto o servidor valida anti-spoof
+  (sender_id == session.clientId) e atua como relay cego.
+
+--------------------------------------------------------------------------------
+12. Ausência de Framing de Tipo e Delimitadores no Handshake/Controle (Págs. 4 e 8)
+--------------------------------------------------------------------------------
+- Incoerência no PDF:
+  O PDF detalha o layout de bytes apenas do frame E2E (12B + 16B + 16B + 8B + ct),
+  sem especificar como diferenciar mensagens de handshake, controle e E2E no
+  stream TCP nem como delimitar campos de tamanho variável (assinatura RSA e
+  certificado server.crt) no HELLO_REPLY.
+- Solução adotada (Decisões D4 a D7 — Framing / Messages / RsaPss / CertUtil):
+  Adotado 1 byte inicial de tipo (0x01 HELLO, 0x02 HELLO_REPLY, 0x03 CONTROL,
+  0x04 E2E), prefixos uint16 big-endian para assinatura e certificado no
+  HELLO_REPLY, 5 opcodes internos no canal CONTROL, parâmetros explícitos de
+  RSASSA-PSS (D6) e certificado server.crt em formato binário DER (D7).
+
+
