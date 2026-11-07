@@ -45,12 +45,13 @@
 - Detalhes e estrutura obrigatória em `docs/05-documentacao-explicativa.md`.
 
 ## 6. Fluxo de trabalho por task
-1. Leia a task em `docs/04-tasks.md` e seus critérios de aceitação.
-2. Implemente apenas o escopo da task.
-3. Escreva/rode os testes da task (`scripts/test`). Tudo precisa compilar sem warnings relevantes (`javac -Xlint:all`).
-4. Atualize `EXPLICACAO_SISTEMA.txt`.
-5. Marque a task com `[x]` em `docs/04-tasks.md` e resuma em 3–5 linhas o que foi feito e como o aluno pode demonstrar.
-6. Só então passe para a próxima.
+1. **Sempre que iniciar uma nova task, analise o sistema (código existente, testes e documentação) e procure por erros e inconsistências** antes de avançar.
+2. Leia a task em `docs/04-tasks.md` e seus critérios de aceitação.
+3. Implemente apenas o escopo da task.
+4. Escreva/rode os testes da task (`scripts/test`). Tudo precisa compilar sem warnings relevantes (`javac -Xlint:all`).
+5. Atualize `EXPLICACAO_SISTEMA.txt`.
+6. Marque a task com `[x]` em `docs/04-tasks.md` e resuma em 3–5 linhas o que foi feito e como o aluno pode demonstrar.
+7. Só então passe para a próxima.
 
 ## 7. Estrutura de pastas e pacotes
 A estrutura está em `docs/07-estrutura-do-projeto.md` e é uma **base de referência, não uma regra absoluta**: pode ser adaptada quando fizer sentido, respeitando os princípios da seção 4 daquele documento (principalmente: derivação de chaves E2E só no cliente, dependências em um único sentido, criptografia isolada, logs via `SecureLog`). Toda mudança estrutural deve ser refletida no MAPA DO CÓDIGO de `EXPLICACAO_SISTEMA.txt` na mesma task.

@@ -1,0 +1,12 @@
+# Saída de compilação Java
+out/
+
+# Chave privada do servidor (PKCS#12) — nunca versionar
+certs/server.p12
+
+# Arquivos temporários de IDE / SO
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+

@@ -1,0 +1,805 @@
+================================================================================
+EXPLICACAO_SISTEMA.txt — Mensageria Segura Multi-Cliente (E2E) em Java 21 Puro
+================================================================================
+
+Documento didático e roteiro de explicação oral do sistema para apresentação
+na disciplina de Segurança da Informação (Prof. Michel Sales).
+
+--------------------------------------------------------------------------------
+1. VISÃO GERAL
+--------------------------------------------------------------------------------
+Este sistema implementa uma aplicação de mensageria instantânea multi-cliente
+com criptografia ponta-a-ponta (E2E — End-to-End Encryption) usando apenas o
+JDK 21 padrão, sem bibliotecas externas.
+
+Existem três papéis principais:
+- Cliente Remetente (ex.: Cliente A): cifra as mensagens localmente com a chave
+  compartilhada apenas com o destinatário.
+- Cliente Destinatário (ex.: Cliente B): valida autenticidade, integridade e
+  ordem das mensagens e as decifra localmente.
+- Servidor (Relay / Rendezvous): autentica-se perante os clientes via RSA-PSS,
+  distribui as chaves públicas efêmeras X25519 entre os participantes e repassa
+  os frames E2E de um cliente para outro sem jamais possuir as chaves E2E.
+
+--------------------------------------------------------------------------------
+2. GLOSSÁRIO
+--------------------------------------------------------------------------------
+- sk / pk (Secret Key / Public Key): par de chaves assimétricas. A chave privada
+  (sk) nunca sai da memória do seu dono; a chave pública (pk) é enviada na rede.
+- X25519: função de acordo de chaves em curva elíptica Curve25519 (RFC 7748) que
+  opera com chaves públicas raw de 32 bytes em formato little-endian.
+- ECDH (Elliptic Curve Diffie-Hellman): protocolo em que duas partes combinam a
+  sua chave privada com a chave pública da outra parte para obter o mesmo
+  segredo compartilhado Z.
+- ECDHE (ECDHE Efêmero): uso de pares de chaves X25519 gerados do zero a cada
+  sessão/execução e descartados ao final, garantindo Forward Secrecy.
+- Z_AB: segredo bruto de 32 bytes resultante do X25519 entre A e B; usado como
+  entrada do HKDF e imediatamente zerado da memória.
+- HKDF (HMAC-based Key Derivation Function — RFC 5869): função em duas etapas
+  (Extract e Expand) baseada em HMAC-SHA256 para transformar Z_AB e um salt em
+  chaves simétricas criptograficamente uniformes e separadas por direção.
+- PRK (Pseudorandom Key): chave intermediária de 32 bytes produzida pelo
+  HKDF-Extract(salt, IKM).
+- AES-GCM (Advanced Encryption Standard - Galois/Counter Mode): cifra autenticada
+  que fornece simultaneamente confidencialidade e integridade.
+- AEAD (Authenticated Encryption with Associated Data): modalidade de cifra
+  (como o AES-GCM) que cifra o texto claro e autentica tanto o texto cifrado
+  quanto metadados em texto claro (AAD).
+- Nonce (Number used once): valor de 12 bytes único por mensagem sob uma mesma
+  chave AES-GCM, formado por IV_base (4 bytes) concatenado com seq_no (8 bytes).
+- Tag GCM: código de autenticação de 16 bytes (128 bits) gerado pelo AES-GCM e
+  anexado ao final do ciphertext; qualquer alteração de 1 bit invalida a tag.
+- AAD (Additional Authenticated Data): dados em claro (como IDs de origem/destino
+  e número de sequência) autenticados pela tag GCM, mas não cifrados.
+- RSA-PSS (Probabilistic Signature Scheme): esquema moderno de assinatura RSA
+  com aleatoriedade (salt de 32 bytes) e MGF1-SHA256, usado pelo servidor para
+  assinar o hash do handshake.
+- Certificado autoassinado (server.crt): certificado X.509 em formato binário DER
+  contendo a chave pública RSA do servidor.
+- Certificate Pinning (Pinagem de certificado): técnica em que o cliente possui
+  uma cópia local confiável de certs/server.crt e exige igualdade exata byte a
+  byte antes de confiar na chave pública do servidor.
+- Forward Secrecy (Sigilo Perfeito Adiante): propriedade que garante que o
+  vazamento futuro da chave RSA de longo prazo do servidor não permite decifrar
+  sessões passadas, pois cada sessão usa chaves efêmeras X25519 descartadas.
+- Replay (Ataque de repetição): reenvio malicioso de um pacote legítimo já
+  capturado anteriormente; neutralizado pelo contador monotônico seq_no.
+- seq_no (Sequence Number): inteiro de 64 bits (8 bytes big-endian) que começa
+  em 0 e cresce +1 a cada mensagem enviada naquela direção.
+- IV_base: prefixo de 4 bytes do nonce; aleatório nas mensagens E2E e fixo
+  (0x00000001) no canal de controle Servidor -> Cliente.
+
+--------------------------------------------------------------------------------
+3. ARQUITETURA
+--------------------------------------------------------------------------------
+Diagrama de comunicação:
+
+  +-----------+            Frames TCP (0x01..0x04)            +-----------+
+  | Cliente A | <===========================================> | Cliente B |
+  +-----------+                       ^                       +-----------+
+        \                             |                             /
+         \      1. Handshake (HELLO / HELLO_REPLY)                 /
+          \     2. Canal de Controle S->C (Key_S2C)               /
+           \    3. Relay de Frames 0x04 E2E (sem decifrar)       /
+            v                                                   v
+         +---------------------------------------------------------+
+         |                 Servidor (Relay Cego)                   |
+         |   Guarda: client_id, pk_C, salt_srv, Key_S2C, sockets   |
+         |   NÃO guarda nem conhece: Z_AB, Key_A2B, Key_B2A        |
+         +---------------------------------------------------------+
+
+O que o Servidor SABE (`securechat.server`):
+- `client_id` (16 B), `pk_C` (32 B raw X25519) e `salt_srv` (16 B) de cada cliente;
+- `Key_S2C` (16 B) do canal administrativo Servidor -> Cliente;
+- Metadados de roteamento do cabeçalho E2E (`nonce`, `sender_id`, `recipient_id`, `seq_no`)
+  e tamanho em bytes do ciphertext+tag.
+
+O que o Servidor NÃO SABE (Servidor Cego):
+- As chaves privadas efêmeras dos clientes (`sk_C`);
+- O segredo compartilhado E2E (`Z_AB = ECDH(sk_A, pk_B)`);
+- As chaves simétricas E2E (`Key_A2B` e `Key_B2A`);
+- O texto claro das mensagens trocadas entre os clientes.
+
+--------------------------------------------------------------------------------
+4. HANDSHAKE PASSO A PASSO
+--------------------------------------------------------------------------------
+Implementado em `securechat/server/ServerHandshake.java::perform` e
+`securechat/client/ClientHandshake.java::perform`:
+
+  Cliente                                                            Servidor
+    |                                                                   |
+    |  1. Gera client_id (UUID 16B) e par efêmero X25519 (sk_C, pk_C)   |
+    |  2. Envia 0x01 HELLO: [client_id (16B) || pk_C (32B raw)]         |
+    | ----------------------------------------------------------------> |
+    |                                                                   |
+    |                 3. Gera salt_srv (16B) e par X25519 (sk_S, pk_S)  |
+    |                 4. Calcula H = SHA256(pk_S||pk_C||client_id||salt)|
+    |                 5. Assina H com RSA-PSS (certs/server.p12, D6)    |
+    |                 6. Deriva Key_S2C = HKDF(salt, ECDH(sk_S,pk_C))   |
+    |                    e apaga Z_ctrl e sk_S da memória               |
+    |                                                                   |
+    |  7. Recebe 0x02 HELLO_REPLY: [pk_S || salt_srv || sig || cert]    |
+    | <---------------------------------------------------------------- |
+    |                                                                   |
+    |  8. Valida Pinning (D7): cert recebido == certs/server.crt local  |
+    |  9. Recalcula H localmente e verifica assinatura RSA-PSS (D6)     |
+    | 10. Deriva Key_S2C = HKDF(salt_srv, ECDH(sk_C, pk_S), "S2C", 16B) |
+    |     e apaga Z_ctrl da memória                                     |
+
+O que acontece se qualquer validação falhar?
+- Se o certificado DER enviado no `HELLO_REPLY` diferir em 1 bit do certificado
+  pinado local (`CertUtil.verifyPinnedCertificate`), o cliente lança
+  `ProtocolException`, loga via `SecureLog.rejected` e fecha o socket antes mesmo
+  de tentar verificar a assinatura.
+- Se a assinatura RSA-PSS não validar sobre o `H` recalculado pelo próprio cliente
+  (`RsaPss.verify`), o cliente aborta a conexão imediatamente (impede MITM na
+  distribuição de chaves ou replay de handshake de outra sessão).
+- Durante o handshake, ambos os lados aplicam `socket.setSoTimeout(timeoutMs)`
+  (padrão 10 s) e restauram `setSoTimeout(0)` ao concluir, evitando conexões
+  penduradas (Slowloris / DoS).
+
+--------------------------------------------------------------------------------
+5. DERIVAÇÃO DAS CHAVES E2E
+--------------------------------------------------------------------------------
+As primitivas criptográficas base estão implementadas em:
+- `securechat/common/X25519Util.java`:
+  - `generateKeyPair()`: gera par efêmero na curva Curve25519.
+  - `toRawPublicKey(PublicKey)` e `fromRawPublicKey(byte[32])`: convertem entre a
+    coordenada `u` (`BigInteger` big-endian do JCA) e os 32 bytes raw em ordem
+    little-endian exigidos pelo RFC 7748, aplicando a máscara `raw[31] &= 0x7F`.
+  - `sharedSecret(skSelf, pkPeer)`: executa `KeyAgreement("X25519")` e rejeita
+    qualquer segredo compartilhado `Z` todo zero (ponto de ordem baixa).
+- `securechat/common/Hkdf.java`:
+  - `extract(salt, ikm)`: calcula `PRK = HMAC-SHA256(key = salt, data = ikm)` (32 B).
+  - `expand(prk, info, L)`: executa o laço `T(i) = HMAC-SHA256(prk, T(i-1) || info || i)`
+    para derivar chaves simétricas de 16 bytes separadas por direção (`info="A2B"`,
+    `info="B2A"` e `info="S2C"`).
+
+Por que não usar `Z_AB` diretamente no AES?
+1. `Z_AB` é um ponto da curva elíptica e não possui bits perfeitamente uniformes;
+   o `HKDF-Extract` com `salt` concentra a entropia em uma chave pseudoaleatória `PRK`.
+2. `Z_AB` é simétrico (`ECDH(A,B) == ECDH(B,A)`). Se A e B usassem a mesma chave AES
+   nas duas direções, poderiam colidir nonces (`seq_no = 0` enviado por A e por B
+   ao mesmo tempo) ou sofrer ataque de reflexão. O `HKDF-Expand` com `"A2B"` e `"B2A"`
+   produz chaves distintas por sentido.
+
+Como a derivação entre peers funciona no cliente (`securechat/client/PeerState.java::derive`):
+1. Ao receber `PEER_LIST` ou `PEER_JOINED`, o cliente compara seu `selfId` com `peerId`
+   usando `ClientId.compareTo` (`Arrays.compareUnsigned`):
+   - **A** = o cliente com o menor `client_id` (comparação unsigned de 16 bytes);
+   - **B** = o cliente com o maior `client_id`.
+2. Escolha do salt do par (Decisão D2):
+   - Ambos selecionam `salt_par = salt_srv` pertencente ao cliente **A** (que foi
+     distribuído pelo servidor junto com a `pk_C` na lista de peers).
+3. Acordo e derivação:
+   - `Z_AB = X25519Util.sharedSecret(skSelf, peerInfo.pkC())` (32 bytes);
+   - `PRK = Hkdf.extract(salt_par, Z_AB)` (32 bytes);
+   - `Key_A2B = Hkdf.expand(PRK, "A2B", 16)` (16 bytes);
+   - `Key_B2A = Hkdf.expand(PRK, "B2A", 16)` (16 bytes);
+   - Se `self` é A: `keySend = Key_A2B` e `keyRecv = Key_B2A`;
+   - Se `self` é B: `keySend = Key_B2A` e `keyRecv = Key_A2B`.
+4. No bloco `finally` de `PeerState.derive`, os arrays intermediários `Z_AB` e `PRK`
+   são zerados imediatamente com `Bytes.wipe(zAB, prk)`.
+
+--------------------------------------------------------------------------------
+6. FORMATO DO FRAME E2E
+--------------------------------------------------------------------------------
+Todo pacote enviado sobre o socket TCP obedece ao framing implementado em
+`securechat/common/Framing.java` (`writeFrame` e `readFrame`):
+
+  +------------------------+---------------+-----------------------------------+
+  | len (4 B, big-endian)  | type (1 byte) | payload ((len - 1) bytes)         |
+  +------------------------+---------------+-----------------------------------+
+  |<--- prefixo de 4 B --->|<----------- len bytes no total ------------------>|
+
+Como a proteção de framing funciona (`Framing.java::readFrame`):
+1. Lê o primeiro byte do tamanho; se retornar `-1` (EOF antes de qualquer byte),
+   lança `FramingException` com `isCleanEof() == true` (desconexão limpa).
+2. Lê os 3 bytes restantes do tamanho com `readFully` e reconstrói `len` em
+   big-endian.
+3. ANTES de executar `new byte[len - 1]`, valida que `1 <= len <= MAX_FRAME`
+   (`8192` bytes, definido em `Constants.java`). Se um atacante enviar `len <= 0`
+   ou `len > 8192`, o receptor lança `FramingException` sem alocar memória,
+   evitando `NegativeArraySizeException` e `OutOfMemoryError` (DoS).
+4. Lê o byte `type` (`0x01` HELLO, `0x02` HELLO_REPLY, `0x03` CONTROL, `0x04` E2E)
+   e usa `DataInputStream.readFully` para garantir que todos os `len - 1` bytes
+   do payload chegaram. Se a conexão cair no meio, captura `EOFException` e lança
+   `FramingException` (`isCleanEof() == false`).
+
+Estrutura interna dos 4 tipos de mensagens (`securechat/common/Messages.java`):
+
+- `0x01 HELLO` (48 bytes fixos, `packHello` / `unpackHello`):
+  `[client_id : 16B] [pk_C : 32B raw X25519]`
+
+- `0x02 HELLO_REPLY` (`packHelloReply` / `unpackHelloReply`):
+  `[pk_S : 32B] [salt_srv : 16B] [sig_len : 2B] [sig : sig_len B] [cert_len : 2B] [cert : cert_len B]`
+
+- `0x03 CONTROL` (`packControlFrame` / `unpackControlFrame` / `sealControl`):
+  Envelope no fio: `[seq_no : 8B big-endian] [ciphertext + tag GCM (16B)]`
+  - Nonce de 12 B (`buildControlNonce`): `0x00000001 (4B) || seq_no (8B)`
+  - AAD de 24 B (`buildControlAad`): `client_id (16B) || seq_no (8B)`
+  - Opcodes internos após decifrar (`packControlPlaintext` / `unpackControlPlaintext`):
+    - `0x01 REGISTER_OK`: 1 byte
+    - `0x02 PEER_LIST`: `[0x02][n : 2B] + n * [client_id 16B || pk_C 32B || salt_srv 16B]`
+    - `0x03 PEER_JOINED`: `[0x03][client_id 16B || pk_C 32B || salt_srv 16B]` (65 B)
+    - `0x04 PEER_LEFT`: `[0x04][client_id 16B]` (17 B)
+    - `0x05 ERROR`: `[0x05][código 1B][texto UTF-8]`
+
+- `0x04 E2E` (`packE2eFrame` / `unpackE2eFrame`):
+  +------------+---------------+------------------+------------+----------------------+
+  | nonce (12B)| sender_id(16B)| recipient_id(16B)| seq_no (8B)| ciphertext + tag(16B)|
+  +------------+---------------+------------------+------------+----------------------+
+  |<------------------ cabeçalho em claro (52 bytes) --------->|<-- cifrado (AES) --->|
+  - `nonce (12B)` = `IV_base_send (4B) || seq_no (8B big-endian)` (`buildE2eNonce`)
+  - `AAD (40B)`   = `sender_id (16B) || recipient_id (16B) || seq_no (8B)` (`buildE2eAad`)
+  - `unpackE2eFrame` valida imediatamente que os 8 últimos bytes do `nonce` são
+    idênticos ao campo `seq_no` do cabeçalho e que `seq_no >= 0`.
+
+--------------------------------------------------------------------------------
+7. ENVIO E RECEBIMENTO
+--------------------------------------------------------------------------------
+1. Envio no Remetente (`Client.java::sendMessage` -> `PeerState.java::sealMessage`):
+   - Valida que o texto UTF-8 tem no máximo `MAX_PLAINTEXT = 4096` bytes.
+   - Adquire o lock do `PeerState`, lê `currentSeq = seqSend` (inicia em 0).
+   - Monta `nonce = ivBaseSend (4B) || currentSeq (8B big-endian)`.
+   - Monta `AAD = selfId (16B) || peerId (16B) || currentSeq (8B big-endian)`.
+   - Cifra com `AesGcm.encrypt(keySend, nonce, aad, plaintext)` gerando `ciphertext || tag`.
+   - Só DEPOIS de montar o frame com sucesso, incrementa `seqSend = currentSeq + 1`.
+   - Empacota no formato `0x04 E2E` e envia pelo socket sob `writeLock`.
+
+2. Roteamento Cego no Servidor (`ClientConnection.java::readLoop`):
+   - Lê o cabeçalho do frame `0x04 E2E` via `Messages.unpackE2eFrame`.
+   - Checa anti-spoof: `e2e.senderId().equals(session.clientId())`; se divergir,
+     rejeita e loga via `SecureLog.rejected`.
+   - Busca `Session target = registry.get(e2e.recipientId())`; se não existir,
+     envia `CONTROL(ERROR, ERR_UNKNOWN_RECIPIENT)` de volta ao remetente.
+   - Repassa os bytes brutos do frame E2E (`target.forwardE2ePayload`) sem tocar
+     no ciphertext nem na tag.
+
+3. Recebimento no Destinatário (`Client.java::processE2eFrame` -> `PeerState.java::openMessage`):
+   - Confere `recipient_id == selfId` e localiza o remetente na `PeerTable`.
+   - Confere `nonceSeqNo == seq_no` do cabeçalho e `seq_no > seqRecv` (anti-replay).
+   - Se `ivBaseRecv != null`, confere que os 4 primeiros bytes do nonce são iguais
+     ao `ivBaseRecv` aprendido no 1º frame válido (Decisão D3).
+   - Decifra com `AesGcm.decrypt(keyRecv, nonce, aad, ciphertextWithTag)`.
+   - SOMENTE se a tag GCM validar: fixa `ivBaseRecv` (se era o 1º frame) e atualiza
+     `seqRecv = seq_no`, entregando a mensagem ao `Cli`.
+
+--------------------------------------------------------------------------------
+8. ANTI-REPLAY E INTEGRIDADE
+--------------------------------------------------------------------------------
+A proteção de confidencialidade e integridade autenticada é implementada em
+`securechat/common/AesGcm.java`:
+- Usa `Cipher.getInstance("AES/GCM/NoPadding")` criando uma instância NOVA a cada
+  chamada de `encrypt` e `decrypt` (evita o reuso de estado de IV proibido pelo JCA
+  e garante thread-safety).
+- `buildNonce(ivBase, seqNo)` monta o nonce de 12 bytes: `IV_base (4B) || seq_no (8B)`.
+- `buildControlNonce(seqNo)` monta o nonce de controle: `0x00000001 (4B) || seq_no (8B)`.
+- Antes de `doFinal`, injeta os metadados em claro via `cipher.updateAAD(aad)`.
+  Assim, a tag GCM de 16 bytes (128 bits) anexada ao fim do ciphertext autentica
+  simultaneamente o texto cifrado e o cabeçalho (`sender_id`, `recipient_id`, `seq_no`).
+- Na decifragem (`AesGcm.java::decrypt`), qualquer alteração de 1 bit no ciphertext,
+  na tag, no nonce ou no AAD dispara `AEADBadTagException`, que é convertida em
+  `ProtocolException("tag mismatch...")` sem liberar nenhum byte decifrado.
+
+A autenticidade do handshake do servidor é garantida por `securechat/common/RsaPss.java`
+e `securechat/common/Messages.java::handshakeHash`:
+- `Messages.handshakeHash` calcula `H = SHA256(pk_S || pk_C || client_id || salt_srv)`.
+- `RsaPss.sign` e `RsaPss.verify` fixam `PSSParameterSpec` com `SHA-256`, `MGF1-SHA-256`,
+  salt de 32 bytes e trailer `0xBC` (Decisão D6), exigindo chave RSA >= 2048 bits.
+
+Controle de janela monotônica e anti-replay (`Client.java` e `PeerState.java`):
+- No canal de controle (`Client.java::processControlFrame`):
+  - O cliente mantém `ctrlSeqRecv = -1`.
+  - Todo frame `0x03 CONTROL` com `seq_no <= ctrlSeqRecv` é rejeitado antes de
+    aplicar qualquer alteração.
+  - `ctrlSeqRecv` só é atualizado para `cf.seqNo()` DEPOIS que `AesGcm.decrypt`
+    valida a tag GCM de 16 bytes (impede que um pacote forjado com `seq_no` alto
+    bloqueie os pacotes legítimos seguintes do servidor).
+- No canal E2E (`PeerState.java::openMessage`):
+  - Cada par possui `seqSend = 0` e `seqRecv = -1` independentes.
+  - Na recepção, exige-se `frame.seqNo() > seqRecv` e que `IV_base` coincida com
+    `ivBaseRecv` (aprendido no 1º frame válido, Decisão D3).
+  - Tanto `ivBaseRecv` quanto `seqRecv` só são atualizados DEPOIS que a tag GCM
+    valida com sucesso (Regra de Ouro 5).
+
+--------------------------------------------------------------------------------
+9. ESTRUTURAS DE DADOS
+--------------------------------------------------------------------------------
+No Servidor (`securechat/server/Session.java` e `SessionRegistry.java`):
+- `Session`:
+  - `clientId` (`ClientId`): identificador de 16 bytes do cliente conectado.
+  - `socket` / `out`: socket TCP e `DataOutputStream` de saída.
+  - `writeLock` (`ReentrantLock`): protege a escrita no socket sem causar
+    "pinning" das virtual threads do Java 21 (como ocorreria com `synchronized`).
+    O incremento de `seqSend` e a escrita de mensagens `CONTROL` ocorrem dentro
+    do mesmo `writeLock`, garantindo que a ordem de `seq_no` no fio seja igual
+    à ordem de transmissão.
+  - `publicKey` (`byte[32]`): chave pública X25519 raw do cliente (`pk_C`).
+  - `salt` (`byte[16]`): `salt_srv` gerado no handshake do cliente.
+  - `keyCtrl` (`byte[16]`): `Key_S2C` usada EXCLUSIVAMENTE no canal de controle
+    Servidor -> Cliente (`REGISTER_OK`, `PEER_LIST`, `PEER_JOINED`, `PEER_LEFT`,
+    `ERROR`). Não é chave E2E.
+  - `seqSend` (`long`, inicia em `0`): contador monotônico das mensagens de
+    controle do servidor para este cliente.
+  - `seqRecv` (`long`, inicia em `-1`): mantido na estrutura conforme o modelo
+    do enunciado, mas não bloqueia o roteamento de frames E2E (já que no cliente
+    o `seq_no` E2E é independente por par destinatário).
+- `SessionRegistry`:
+  - Encapsula `ConcurrentHashMap<ClientId, Session> sessions`.
+  - `register(Session)` usa `putIfAbsent` para recusar `client_id` duplicado
+    ativo (Decisão D4).
+  - `removeIfSame(clientId, session)` usa `sessions.remove(id, session)` no
+    `finally` de `ClientConnection` para que uma conexão duplicada rejeitada
+    jamais remova a sessão original ativa.
+
+No Cliente (`securechat/client/PeerState.java`, `PeerTable.java` e `Client.java`):
+- `PeerState`:
+  - `peerId` (`ClientId`): identificador de 16 bytes do peer remoto.
+  - `publicKey` (`byte[32]`): chave pública X25519 raw do peer.
+  - `salt` (`byte[16]`): `salt_par` escolhido pela regra D2 (salt do menor ID).
+  - `keySend` (`byte[16]`) e `keyRecv` (`byte[16]`): chaves AES-128-GCM unidirecionais.
+  - `ivBaseSend` (`byte[4]`): 4 bytes aleatórios gerados com `SecureRandom`.
+  - `ivBaseRecv` (`byte[4]`, inicia `null`): aprendido no 1º frame E2E autenticado (D3).
+  - `seqSend` (`long`, inicia `0`) e `seqRecv` (`long`, inicia `-1`), protegidos
+    por `ReentrantLock`.
+- `PeerTable`:
+  - Encapsula `ConcurrentHashMap<ClientId, PeerState> peers`.
+  - `upsertPeer`: ignora o próprio `selfId`, deriva novo `PeerState` e substitui
+    atomicamente o estado anterior em caso de reconexão (chamando `wipe()` nas
+    chaves antigas).
+  - `removePeer`: remove o peer em `PEER_LEFT` e chama `wipe()` nas chaves.
+
+--------------------------------------------------------------------------------
+10. MAPA DO CÓDIGO
+--------------------------------------------------------------------------------
+| Arquivo / Classe                      | Métodos Principais   | Parte do Protocolo            | Sugestão Apresentação |
+|---------------------------------------|----------------------|-------------------------------|-----------------------|
+| `securechat.common.Constants`         | (constantes estáticas)| Tamanhos, limites, opcodes    | Integrante 1 (Base)   |
+| `securechat.common.ClientId`          | `fromBytes`, `random`, `compareTo`, `equals`, `hashCode` | Identificador UUID 16B e ordem canônica A/B (`compareUnsigned`) | Integrante 1 (Base) |
+| `securechat.common.Bytes`             | `concat`, `longToBytes`, `constantTimeEquals`, `wipe`, `sha256`, `fingerprint` | Manipulação de bytes, tempo constante e limpeza de segredos | Integrante 1 (Base) |
+| `securechat.common.Framing`           | `writeFrame`, `readFrame` | Framing TCP de 4B big-endian com validação pré-alocação | Integrante 1 (Base) |
+| `securechat.common.ProtocolException` | Construtor            | Exceção verificada para violações do protocolo | Integrante 1 (Base) |
+| `securechat.common.FramingException`  | `isCleanEof`          | Exceção para frames truncados ou fora do limite | Integrante 1 (Base) |
+| `securechat.common.SecureLog`         | `connected`, `disconnected`, `rejected`, `routed`, `info` | Logger centralizado tipado (impede logar segredos/bytes) | Integrante 4 (Segurança) |
+| `securechat.common.X25519Util`        | `generateKeyPair`, `toRawPublicKey`, `fromRawPublicKey`, `sharedSecret` | ECDHE X25519 com chaves raw 32B little-endian (RFC 7748) | Integrante 1 (Cripto) |
+| `securechat.common.Hkdf`              | `extract`, `expand`, `deriveKey` | Derivação HKDF-SHA256 manual (RFC 5869) | Integrante 1 (Cripto) |
+| `securechat.common.AesGcm`            | `buildNonce`, `buildControlNonce`, `encrypt`, `decrypt` | Cifra autenticada AES-128-GCM com AAD e Cipher novo por operação | Integrante 1 (Cripto) |
+| `securechat.common.RsaPss`            | `sign`, `verify`     | Assinatura RSA-PSS com parâmetros fixos D6 | Integrante 1 (Cripto) |
+| `securechat.common.CertUtil`          | `loadServerIdentity`, `loadPinnedCertificate`, `verifyPinnedCertificate` | Carregamento PKCS#12 do servidor e Certificate Pinning D7 no cliente | Integrante 1 (Cripto) |
+| `securechat.common.Messages`          | `handshakeHash`, `packHello`/`unpackHello`, `packHelloReply`/`unpackHelloReply`, `sealControl`/`unpackControlPlaintext`, `packE2eFrame`/`unpackE2eFrame` | Empacotamento binário byte a byte de todas as mensagens e AADs | Integrante 1 (Protocolo) |
+| `securechat.server.ServerHandshake`   | `perform`            | Handshake do servidor: ECDHE X25519, assinatura RSA-PSS sobre `H` e `Key_S2C` | Integrante 2 (Handshake) |
+| `securechat.server.Session`           | `sendControl`, `forwardE2ePayload`, `closeAndWipe` | Estado de sessão no servidor, `writeLock` e canal de controle `Key_S2C` | Integrante 2 (Servidor) |
+| `securechat.server.SessionRegistry`   | `register`, `removeIfSame`, `get`, `snapshotOtherPeerInfos` | Registro concorrente de sessões (`ConcurrentHashMap`) e D4 | Integrante 2 (Servidor) |
+| `securechat.server.ClientConnection`  | `run`, `readLoop`    | Ciclo de vida por cliente (virtual thread), controle e relay cego E2E | Integrante 2 (Servidor) |
+| `securechat.server.Server`            | `start`, `close`, `main` | Aceitação de conexões (`ServerSocket` + virtual threads + `Semaphore`) | Integrante 2 (Servidor) |
+| `securechat.client.ClientHandshake`   | `perform`            | Handshake do cliente: envio de `HELLO`, pinning D7, validação RSA-PSS e `Key_S2C` | Integrante 2 (Handshake) |
+| `securechat.client.PeerState`         | `derive`, `sealMessage`, `openMessage`, `wipe` | Derivação E2E (`Key_A2B`/`Key_B2A`, D2), cifragem, anti-replay e D3 | Integrante 3 (Cliente/E2E) |
+| `securechat.client.PeerTable`         | `upsertPeer`, `removePeer`, `resolveByPrefix` | Tabela concorrente de peers, reconexão e limpeza de chaves | Integrante 3 (Cliente/E2E) |
+| `securechat.client.Client`            | `connect`, `processControlFrame`, `processE2eFrame`, `sendMessage`, `main` | Estado do cliente, anti-replay de controle e mensageria E2E | Integrante 3 (Cliente/E2E) |
+| `securechat.client.Cli`               | `startInteractive`, `handleCommandLine` | CLI interativo (`/peers`, `/msg`, `/quit`) e exibição de fingerprints | Integrante 3 (Cliente/E2E) |
+| `securechat.tools.TamperProxy`        | `start`, `pipeClientToServer`, `main` | Proxy TCP intermediário (`sniff`, `bitflip`, `replay`, `badframe`) | Integrante 4 (Segurança) |
+| `securechat.tools.DemoScenarioRunner` | `runDemoE2e`, `runDemoBitflip`, `runDemoReplay`, `runDemoBadframe`, `main` | Demonstração ao vivo dos 4 cenários (`scripts/demo-*`) | Todos (Demo ao vivo) |
+| `test/securechat/Assert.java`         | `assertTrue`, `assertFalse`, `assertEquals`, `assertArrayEquals`, `assertThrows` | Asserções de teste sem JUnit | Integrante 4 (Testes) |
+| `test/securechat/TestRunner.java`     | `main`, `testConstantsSanity` | Runner próprio que executa os 43 testes automatizados | Integrante 4 (Testes) |
+| `test/securechat/common/FramingAndUtilsTest.java` | `testFrameOk`, `testFrameTruncated`, `testClientIdUnsignedComparison` | Testes de framing TCP, `ClientId` e `Bytes` (T01) | Integrante 1 (Base) |
+| `test/securechat/common/CryptoPrimitivesTest.java` | `testX25519Rfc7748Vector`, `testHkdfRfc5869Vector`, `testAesGcmRoundTripAndTamperDetection`, `testRsaPssSignVerifyAndMismatchedParams` | Testes dos vetores oficiais RFC 7748, RFC 5869, AES-GCM e RSA-PSS (T02) | Integrante 1 (Cripto) |
+| `test/securechat/common/CertUtilTest.java` | `testLoadKeystoreAndVerifyPinnedCert`, `testServerP12InGitignore` | Testes de PKCS#12, DER e pinning D7 (T03) | Integrante 1 (Cripto) |
+| `test/securechat/common/MessagesTest.java` | `testHelloRoundTripAndMalformed`, `testHelloReplyRoundTripAndMalformed`, `testControlMessagesRoundTripAndMalformed`, `testE2eFrameRoundTripAndMalformed` | Testes de empacotamento binário e entradas malformadas (T04) | Integrante 1 (Protocolo) |
+| `test/securechat/HandshakeTest.java`  | `testHandshakeSuccess`, `testHandshakeWrongCertificateAborts`, `testHandshakeCorruptedSignatureAborts`, `testHandshakeSwappedClientIdInHashAborts`, `testHandshakeTimeoutHandled` | Testes de integração do handshake e falhas de autenticação (T05) | Integrante 2 (Handshake) |
+| `test/securechat/ServerSessionControlTest.java` | `testThreeClientsJoinAndLeaveNotifications`, `testDuplicateActiveClientIdRejected` | Testes de registro de sessão, notificações de peers e D4 (T06) | Integrante 2 (Servidor) |
+| `test/securechat/ClientPeerDerivationTest.java` | `testCrossKeyDerivationSymmetry`, `testReconnectionGeneratesNewKeysAndResetsCounters`, `testControlChannelReplayAndTamperRejected` | Testes de simetria `Key_A2B`/`Key_B2A`, reconexão e anti-replay de controle (T07) | Integrante 3 (Cliente/E2E) |
+| `test/securechat/E2eMessagingTest.java` | `testBidirectionalE2eMessagingAndCli`, `testMaxPlaintextLimitEnforcedOnClient`, `testUnknownRecipientReturnsControlErrorToSender`, `testIvBaseRecvChangedMidSessionRejected` | Testes de envio/recebimento E2E, limite 4096B e D3 (T08) | Integrante 3 (Cliente/E2E) |
+| `test/securechat/SecurityTests.java`  | `testSniffModeConfidentiality`, `testBitflipRejectedByRecipient`, `testReplayRejectedByRecipient`, `testBadFrameDisconnectsSafelyWithoutCrashingServer`, `testForgedSenderIdDiscardedByServer`, `testEndToEndReconnectionWithSameClientId` | Testes automatizados dos 6 cenários de ataque/segurança da T09 | Integrante 4 (Segurança) |
+| `test/securechat/RobustnessAndLogPolicyTest.java` | `testServerSurvivesRandomBytesEofAndMalformedTraffic`, `testServerMaxClientsLimitAndRecovery`, `testSourceCodeLogPolicyAudit` | Testes de robustez contra tráfego aleatório, limite `MAX_CLIENTS` e auditoria da política de logs (T10) | Integrante 4 (Segurança) |
+
+--------------------------------------------------------------------------------
+11. GARANTIAS DE SEGURANÇA
+--------------------------------------------------------------------------------
+1. Confidencialidade Ponta-a-Ponta (E2E):
+   - Mecanismo: Cifragem autenticada AES-128-GCM com chaves direcionais (`Key_A2B` e
+     `Key_B2A`) derivadas via ECDHE X25519 (`Z_AB`) + HKDF-SHA256 exclusivamente nos
+     clientes. O servidor só calcula `Key_S2C` e jamais recebe ou calcula `Z_AB`.
+   - Onde no código: `PeerState.java::derive`, `PeerState.java::sealMessage`,
+     `AesGcm.java::encrypt`.
+   - Como demonstrar: No modo `sniff` do `TamperProxy` (`SecurityTests::testSniffModeConfidentiality`),
+     os bytes capturados no fio não contêm a substring do plaintext enviado.
+
+2. Integridade e Autenticidade das Mensagens (AEAD):
+   - Mecanismo: Tag GCM de 128 bits (16 bytes) calculada sobre o ciphertext e sobre os
+     40 bytes de AAD (`sender_id || recipient_id || seq_no`) no E2E (ou 24 bytes no
+     CONTROL). Qualquer alteração de 1 bit no ciphertext, na tag, no nonce ou no AAD
+     dispara `AEADBadTagException` na decifragem.
+   - Onde no código: `AesGcm.java::encrypt`/`decrypt`, `Messages.java::buildE2eAad`,
+     `PeerState.java::openMessage`.
+   - Como demonstrar: No modo `bitflip` do `TamperProxy` (`SecurityTests::testBitflipRejectedByRecipient`),
+     o proxy inverte 1 bit do 1º byte do ciphertext (`corrupted[52] ^= 0x01`) do 1º frame E2E;
+     o destinatário rejeita com `tag mismatch`, não entrega ao usuário e não avança `seqRecv`,
+     recebendo normalmente a próxima mensagem legítima.
+
+3. Autenticidade do Servidor (Pinning + RSA-PSS):
+   - Mecanismo: O cliente fixa o certificado público `certs/server.crt` em formato DER
+     comparando byte a byte em tempo constante (`MessageDigest.isEqual`, Decisão D7) e
+     verifica a assinatura `RSASSA-PSS` sobre `H = SHA256(pk_S || pk_C || client_id || salt_srv)`.
+   - Onde no código: `CertUtil.java::verifyPinnedCertificate`, `RsaPss.java::verify`,
+     `ClientHandshake.java::perform`.
+   - Como demonstrar: Testes `HandshakeTest::testHandshakeWrongCertificateAborts`,
+     `testHandshakeCorruptedSignatureAborts` e `testHandshakeSwappedClientIdInHashAborts`.
+
+4. Sigilo Perfeito Direto (Forward Secrecy — ECDHE):
+   - Mecanismo: A cada conexão/sessão, tanto o servidor (`sk_S, pk_S`) quanto cada
+     cliente (`sk_C, pk_C`) geram pares de chaves X25519 efêmeros em memória RAM via
+     `X25519Util.generateKeyPair()`. A chave RSA de longo prazo do servidor apenas assina
+     o hash `H` do handshake e não cifra segredos; ao encerrar a sessão ou reconectar,
+     os arrays de chaves simétricas e plaintexts temporários são zerados com `Bytes.wipe`.
+   - Onde no código: `X25519Util.java::generateKeyPair`, `ServerHandshake.java::perform`,
+     `Client.java::connect`, `PeerTable.java::upsertPeer`.
+   - Como demonstrar: Teste `SecurityTests::testEndToEndReconnectionWithSameClientId` prova
+     que uma reconexão com o mesmo `client_id` produz novas chaves X25519 e novos `keySend`/`keyRecv`.
+
+5. Proteção Anti-Replay e Anti-Spoof:
+   - Mecanismo: Nonce determinístico `IV_base (4B) || seq_no (8B)` com contador monotônico
+     estrito (`seq_no > seqRecv` no E2E e `seq_no > ctrlSeqRecv` no CONTROL). O `seqRecv`
+     só avança APÓS a tag GCM validar (Regra de Ouro 5). No servidor, `ClientConnection`
+     exige `e2e.senderId().equals(session.clientId())` antes de rotear.
+   - Onde no código: `PeerState.java::openMessage`, `Client.java::processControlFrame`,
+     `ClientConnection.java::readLoop`.
+   - Como demonstrar: No modo `replay` do `TamperProxy` (`SecurityTests::testReplayRejectedByRecipient`),
+     o proxy duplica o 1º frame E2E; o destinatário aceita a 1ª cópia e descarta a 2ª
+     (`replay E2E: seq_no=0 <= seqRecv=0`). Em `SecurityTests::testForgedSenderIdDiscardedByServer`,
+     um frame E2E com `sender_id` forjado é descartado no servidor.
+
+6. Robustez e Política de Logs (T10):
+   - Mecanismo: `Framing.readFrame` valida `0 < len <= MAX_FRAME` ANTES de alocar memória
+     (`new byte[len]`); o servidor limita conexões concorrentes com `Semaphore(MAX_CLIENTS)`
+     e protege cada thread com blocos `try/catch/finally` que capturam `FramingException`,
+     `ProtocolException`, `IOException` e `RuntimeException`, liberando recursos e limpando
+     chaves (`closeAndWipe`). Toda saída de log passa exclusivamente por `SecureLog`, cujos
+     métodos são estritamente tipados e não aceitam `byte[]`.
+   - Onde no código: `SecureLog.java`, `Framing.java::readFrame`, `ClientConnection.java::run`,
+     `Server.java::acceptLoop`, `Client.java::readLoop`.
+   - Como demonstrar: Testes em `RobustnessAndLogPolicyTest`: tráfego aleatório/EOF/malformado,
+     limite `MAX_CLIENTS` com recuperação de vaga e auditoria estática de todos os `.java` em `src/`.
+
+Detalhamento dos 4 modos do `TamperProxy` (`securechat/tools/TamperProxy.java::pipeClientToServer`):
+- `sniff`: atua como relay transparente logando apenas metadados seguros (`client_id`,
+  `seq_no`, tamanho do ciphertext e fingerprint SHA-256 truncado `ct_sha256_fp`) e
+  armazenando cópia em memória para auditoria nos testes, comprovando que o texto claro
+  não aparece no fio.
+- `bitflip`: no 1º frame E2E (`type == 0x04`), faz `corrupted[Constants.E2E_HEADER_BYTES] ^= 0x01`,
+  invertendo 1 bit no primeiro byte do ciphertext; no destinatário, `AesGcm.decrypt` lança
+  `ProtocolException("tag mismatch")`, `Client` loga `[REJECTED] reason="tag mismatch..."` e
+  preserva `seqRecv` intacto.
+- `replay`: encaminha o 1º frame E2E normalmente e, em seguida, reenvia exatamente os
+  mesmos bytes; no destinatário, o 1º frame valida e atualiza `seqRecv = 0`, enquanto a
+  cópia duplicada falha na checagem `seq_no > seqRecv` e é descartada com `[REJECTED]`.
+- `badframe`: na 1ª tentativa de envio de frame E2E, injeta um prefixo de tamanho inválido
+  (`-42`, negativo) via `sOut.writeInt(-42)`; no servidor, `Framing.readFrame` rejeita
+  antes de alocar memória, desconecta apenas o infrator e mantém os demais clientes
+  operando normalmente.
+
+--------------------------------------------------------------------------------
+12. TESTES E DEMONSTRAÇÃO
+--------------------------------------------------------------------------------
+- Execução da suíte automatizada completa (43 testes):
+  - Linux/macOS: `./scripts/test.sh`
+  - Windows: `scripts\test.bat`
+  - Compila todo o projeto com `javac -Xlint:all --release 21` e executa
+    `securechat.TestRunner`.
+
+- Scripts de demonstração ao vivo (`scripts/demo-*` -> `securechat.tools.DemoScenarioRunner`):
+  - `scripts/demo-e2e` (`.sh` / `.bat`): sobe Servidor + `TamperProxy(SNIFF)` + 3 clientes
+    (Alice, Bob, Carol), exibe os fingerprints `pk_fp` e troca mensagens E2E entre os três.
+  - `scripts/demo-bitflip` (`.sh` / `.bat`): sobe Servidor + `TamperProxy(BITFLIP)` + Alice
+    e Bob; 1ª mensagem sofre inversão de 1 bit no ciphertext e é rejeitada pela tag GCM sem
+    avançar `seqRecv`; 2ª mensagem chega e decifra normalmente.
+  - `scripts/demo-replay` (`.sh` / `.bat`): sobe Servidor + `TamperProxy(REPLAY)` + Alice e
+    Bob; 1ª mensagem é duplicada pelo proxy, a cópia original é aceita (`seq=0`) e a cópia
+    repetida é descartada por `seq_no <= seqRecv`.
+  - `scripts/demo-badframe` (`.sh` / `.bat`): sobe Servidor + `TamperProxy(BADFRAME)` + Alice,
+    Bob e Carol; proxy injeta `len = -42`, servidor desconecta apenas Alice e mantém Bob e
+    Carol trocando mensagens E2E.
+  - `scripts/demo-all` (`.sh` / `.bat`): executa os 4 cenários em sequência.
+
+Tabela dos 10 cenários obrigatórios de segurança (seção 2 de `docs/03`):
+
+| #  | Cenário Obrigatório                 | Classe / Método de Teste                             | Resultado Observado |
+|----|-------------------------------------|------------------------------------------------------|---------------------|
+| 1  | Conversa E2E normal (A <-> B)       | `E2eMessagingTest::testBidirectionalE2eMessagingAndCli`| Mensagens entregues com integridade; servidor apenas roteia (`[ROUTED]`) |
+| 2  | Sniff no servidor / fio (`sniff`)   | `SecurityTests::testSniffModeConfidentiality`        | `TamperProxy` captura o frame E2E; bytes do plaintext não ocorrem no fio |
+| 3  | Bitflip em ciphertext/tag (`bitflip`)| `SecurityTests::testBitflipRejectedByRecipient`      | 1º frame adulterado gera `[REJECTED] tag mismatch`; `seqRecv` não avança; 2ª msg chega OK |
+| 4  | Replay de frame E2E (`replay`)      | `SecurityTests::testReplayRejectedByRecipient`       | 1ª cópia entregue; duplicata descartada com `[REJECTED] replay E2E`; 2ª msg chega OK |
+| 5  | Assinatura RSA-PSS inválida         | `HandshakeTest::testHandshakeCorruptedSignatureAborts`| `ClientHandshake` falha na verificação `RsaPss.verify` e aborta a conexão |
+| 6  | Certificado diferente do pinado (D7)| `HandshakeTest::testHandshakeWrongCertificateAborts` | `CertUtil.verifyPinnedCertificate` detecta divergência DER e aborta o handshake |
+| 7  | Derivação determinística (HKDF/X25519)| `CryptoPrimitivesTest` + `ClientPeerDerivationTest` | Vetores RFC 7748 §6.1 e RFC 5869 A.1 idênticos; `A.keySend == B.keyRecv` e `B.keySend == A.keyRecv` |
+| 8  | Reconexão com mesmo `client_id`     | `SecurityTests::testEndToEndReconnectionWithSameClientId`| Após desconectar e reconectar, `PEER_JOINED` substitui `PeerState` com novas chaves e `seq=0` |
+| 9  | Spoof de `sender_id` no servidor    | `SecurityTests::testForgedSenderIdDiscardedByServer` | Servidor detecta `sender_id != session.clientId()`, loga `[REJECTED]` e não roteia a B |
+| 10 | Frame truncado / acima de `MAX_FRAME` / lixo| `FramingAndUtilsTest` + `SecurityTests::testBadFrameDisconnectsSafelyWithoutCrashingServer` + `RobustnessAndLogPolicyTest` | `Framing.readFrame` rejeita tamanho inválido antes de alocar; servidor sobrevive a bytes aleatórios |
+
+
+--------------------------------------------------------------------------------
+13. DECISÕES DE PROJETO E LIMITAÇÕES
+--------------------------------------------------------------------------------
+Decisões de Projeto (D1 a D7):
+
+- D1 (Significado de `pk_S` no handshake):
+  - Decisão: `pk_S` é uma chave pública X25519 efêmera de 32 bytes gerada pelo
+    servidor a cada conexão (`ServerHandshake.java::perform`), enquanto a chave
+    RSA de longo prazo (`certs/server.p12`) apenas assina o hash `H` do handshake.
+  - Por quê: permite derivar `Key_S2C` via ECDHE (`ECDH(sk_S, pk_C)` + HKDF) para
+    cifrar o canal de controle Servidor -> Cliente com Forward Secrecy, sem usar RSA
+    para cifragem direta.
+
+- D2 (Escolha do `salt` no acordo E2E entre dois clientes):
+  - Decisão: cada cliente recebe seu `salt_srv` no handshake e o servidor o
+    distribui junto com a `pk_C` em `PEER_LIST` e `PEER_JOINED`. Para o par `(A, B)`,
+    onde `A` é o cliente de menor `client_id` (comparação unsigned de 16 bytes em
+    `ClientId.java::compareTo`), ambos usam `salt_par = salt_A` (`PeerState.java::derive`).
+  - Por quê: garante que `A` e `B` passem exatamente o mesmo `salt` ao `Hkdf.extract`
+    de forma 100% determinística e sem precisar de uma mensagem extra de negociação.
+
+- D3 (Conhecimento de `IV_base` do remetente pelo destinatário):
+  - Decisão: o nonce completo de 12 bytes (`IV_base (4B) || seq_no (8B)`) viaja em
+    claro no cabeçalho do frame `0x04 E2E`. No 1º frame E2E cuja tag GCM valida,
+    o destinatário grava os 4 primeiros bytes em `ivBaseRecv` e passa a exigir que
+    todos os frames seguintes daquele peer na mesma sessão mantenham o mesmo prefixo
+    (`PeerState.java::openMessage`).
+  - Por quê: evita estado prévio extra no registro e impede que um atacante altere
+    o prefixo do nonce no meio da sessão.
+
+- D4 (Política para `client_id` duplicado ativo):
+  - Decisão: se um cliente conectar com um `client_id` que já está ativo em
+    `SessionRegistry`, o servidor conclui o handshake da nova conexão (para ter
+    `Key_S2C`), envia `CONTROL(ERROR, ERR_DUPLICATE_CLIENT_ID)` na nova conexão e
+    a encerra, mantendo a sessão original intacta (`ClientConnection.java::run`).
+  - Por quê: protege um cliente legítimo já conectado contra desconexão forçada
+    por terceiros (DoS por colisão/spoof de ID).
+
+- D5 (Demultiplexação de tipos de frame no TCP):
+  - Decisão: todo frame TCP possui 1 byte inicial de tipo (`0x01 HELLO`,
+    `0x02 HELLO_REPLY`, `0x03 CONTROL`, `0x04 E2E`) logo após os 4 bytes de
+    comprimento (`Framing.java`).
+  - Por quê: torna o parsing determinístico, simples de auditar e permite rejeitar
+    imediatamente tipos inesperados após o handshake.
+
+- D6 (Parâmetros explícitos do `RSASSA-PSS`):
+  - Decisão: fixados no código (`RsaPss.java`) `SHA-256`, `MGF1ParameterSpec.SHA256`,
+    `saltLength = 32` bytes e `trailerField = 1` (`0xBC`), com chave RSA >= 2048 bits.
+  - Por quê: o JCA não permite deixar parâmetros PSS implícitos se queremos
+    interoperabilidade garantida entre assinatura e verificação em qualquer JVM.
+
+- D7 (Formato do certificado pinado e comparação em tempo constante):
+  - Decisão: `certs/server.crt` é armazenado em formato binário DER e comparado
+    byte a byte com `MessageDigest.isEqual` em `CertUtil.java::verifyPinnedCertificate`.
+  - Por quê: evita ambiguidades de codificação PEM (quebras de linha/espaços) e
+    elimina vazamento de tempo na comparação.
+
+Limitações Conhecidas e Mitigações:
+1. Confiança no servidor para distribuição de chaves públicas dos peers:
+   - Como o servidor entrega `PEER_LIST` e `PEER_JOINED`, um servidor malicioso que
+     possuísse a chave privada RSA (`server.p12`) poderia tentar um MITM ativo
+     trocando `pk_C` na lista de peers.
+   - Mitigação implementada: o comando `/peers` no `Cli` (e o banner inicial de
+     conexão) exibe o fingerprint SHA-256 truncado (`pk_fp` de 8 bytes em hex via
+     `Bytes.fingerprint`) da chave pública X25519 de cada cliente, permitindo que
+     Alice e Bob comparem seus fingerprints fora de banda (como o Safety Number do
+     Signal/WhatsApp).
+2. Limitação de limpeza de `PrivateKey` no JCA do JDK 21:
+   - Todos os segredos em `byte[]` (`Z_AB`, `Z_ctrl`, `PRK`, `keySend`, `keyRecv`,
+     `keyCtrl`, `plaintext`) são explicitamente sobrescritos com zeros via
+     `Bytes.wipe` (`Arrays.fill(b, (byte) 0)`) assim que deixam de ser necessários.
+   - Entretanto, na implementação padrão do provedor SunEC/SunRsaSign do JDK 21, os
+     objetos `PrivateKey` (`XECPrivateKeyImpl` e `RSAPrivateCrtKeyImpl`) não suportam
+     zeramento in-place via `destroy()` (lançam `DestroyFailedException`). Por isso,
+     para chaves privadas efêmeras de sessão, descartamos todas as referências ao
+     encerrar a sessão para que sejam coletadas pelo Garbage Collector.
+3. Mensageria puramente online (sem fila offline):
+   - O servidor atua estritamente como relay em tempo real em memória; se o
+     destinatário não estiver conectado, o servidor responde `CONTROL(ERROR)` com
+     código `ERR_UNKNOWN_RECIPIENT`.
+
+--------------------------------------------------------------------------------
+14. ROTEIRO DE APRESENTAÇÃO
+--------------------------------------------------------------------------------
+Tempo total sugerido: ~12 a 15 minutos (dividido igualmente entre 4 integrantes).
+
+- Parte 1 — Integrante 1 (Arquitetura, Framing e Primitivas Criptográficas — ~3 min):
+  1. Apresentar a visão geral e o diagrama Cliente A <-> Servidor Cego <-> Cliente B
+     (seção 3), destacando que o servidor nunca calcula `Z_AB`, `Key_A2B` ou `Key_B2A`.
+  2. Mostrar no código:
+     - `Framing.java::readFrame`: validação `1 <= len <= MAX_FRAME` antes de `new byte[n]`.
+     - `X25519Util.java::toRawPublicKey` e `fromRawPublicKey`: explicar a inversão
+       big-endian <-> little-endian dos 32 bytes raw exigida pelo RFC 7748.
+     - `Hkdf.java::extract` e `expand`: implementação manual RFC 5869 com `HmacSHA256`.
+     - `AesGcm.java::encrypt` e `decrypt`: explicar `Cipher` novo por chamada, nonce de
+       12 bytes e `cipher.updateAAD(aad)`.
+
+- Parte 2 — Integrante 2 (Handshake Autenticado, Sessões e Servidor Relay — ~3 min):
+  1. Explicar o fluxo `HELLO` -> `HELLO_REPLY` (seção 4) e o que entra no hash
+     `H = SHA256(pk_S || pk_C || client_id || salt_srv)`.
+  2. Mostrar no código:
+     - `ServerHandshake.java::perform` e `ClientHandshake.java::perform`: pinning DER
+       com `CertUtil.verifyPinnedCertificate` (`MessageDigest.isEqual`), verificação
+       `RsaPss.verify` (parâmetros D6) e derivação de `Key_S2C`.
+     - `Session.java` e `SessionRegistry.java`: mostrar os campos de `Session` para
+       comprovar que lá só existe `keyCtrl` (`Key_S2C`) e nenhuma chave E2E; explicar
+       o uso de `ReentrantLock` nas virtual threads do Java 21.
+     - `ClientConnection.java::readLoop`: mostrar a checagem anti-spoof de `sender_id`
+       e o repasse cego `target.forwardE2ePayload(frame.payload())`.
+
+- Parte 3 — Integrante 3 (Derivação E2E, Anti-Replay e Mensageria no Cliente — ~3 min):
+  1. Explicar como Alice e Bob chegam às mesmas chaves cruzadas sem conversar antes:
+     ordem canônica `A = min(id)`, `B = max(id)` (`Arrays.compareUnsigned`) e escolha
+     do `salt_A` (Decisão D2).
+  2. Mostrar no código:
+     - `PeerState.java::derive`: cálculo de `Z_AB`, `PRK`, `Key_A2B`, `Key_B2A`,
+       atribuição cruzada conforme `selfIsA` e `Bytes.wipe(zAB, prk)` no `finally`.
+     - `PeerState.java::sealMessage` e `openMessage`: mostrar a validação monotônica
+       `frame.seqNo() <= seqRecv`, a fixação do `ivBaseRecv` no 1º frame válido (D3)
+       e o fato de `seqRecv` só atualizar APÓS `AesGcm.decrypt` validar a tag GCM.
+
+- Parte 4 — Integrante 4 (Demonstração ao Vivo, Ataques e Política de Logs — ~4 min):
+  1. Executar a suíte completa de testes automatizados:
+     `.\scripts\test.bat` (ou `./scripts/test.sh`) -> mostrar os 43 testes passando.
+  2. Executar a demonstração ao vivo dos 4 cenários obrigatórios:
+     `.\scripts\demo-all.bat` (ou `./scripts/demo-all.sh`) e apontar no console:
+     - Na DEMO 1 (`e2e` + `sniff`): 3 clientes (Alice, Bob, Carol) trocando mensagens
+       e o `TamperProxy` vendo apenas tamanho e hash do ciphertext.
+     - Na DEMO 2 (`bitflip`): inversão de 1 bit no byte 52 -> Bob rejeita com
+       `tag mismatch`, não avança `seqRecv` e decifra a 2ª mensagem normalmente.
+     - Na DEMO 3 (`replay`): duplicata do frame `seq=0` rejeitada por `seq_no <= seqRecv`.
+     - Na DEMO 4 (`badframe`): prefixo `-42` desconecta apenas o infrator; Bob e Carol
+       continuam conversando.
+  3. Mostrar `SecureLog.java` e concluir resumindo as 5 garantias entregues.
+
+--------------------------------------------------------------------------------
+15. PERGUNTAS PROVÁVEIS DO PROFESSOR
+--------------------------------------------------------------------------------
+P01. O servidor consegue ler as mensagens trocadas entre os clientes? Por quê?
+R: Não. O servidor apenas encaminha os frames `0x04 E2E` (`ClientConnection.java::readLoop`).
+   As chaves `Key_A2B` e `Key_B2A` são derivadas a partir de `Z_AB = ECDH(sk_A, pk_B)`
+   em `PeerState.java::derive`. Como o servidor só conhece as chaves públicas `pk_A` e
+   `pk_B` e nunca tem acesso às chaves privadas `sk_A` ou `sk_B`, é matematicamente
+   inviável para ele calcular `Z_AB`.
+
+P02. Por que nunca se pode reutilizar o mesmo nonce com a mesma chave no AES-GCM?
+R: No AES-GCM, o texto claro é cifrado com um fluxo de chaves gerado pelo modo CTR a
+   partir do nonce, e a tag de autenticação é um polinômio GHASH sobre `GF(2^128)`.
+   Se dois textos claros forem cifrados com a mesma chave e o mesmo nonce, o XOR dos
+   ciphertexts revela o XOR dos plaintexts (`C1 ^ C2 = P1 ^ P2`) e ainda permite
+   recuperar a chave de autenticação `H_GHASH`, quebrando confidencialidade e
+   permitindo forjar tags. Por isso garantimos unicidade com `seq_no` estritamente
+   crescente e chaves separadas por direção (`Key_A2B` != `Key_B2A`).
+
+P03. Por que usamos HKDF-SHA256 em vez de passar o segredo `Z_AB` direto para o AES?
+R: Por dois motivos (`Hkdf.java` e `PeerState.java::derive`): primeiro, a saída bruta
+   do X25519 (`Z_AB`) tem estrutura algébrica de curva elíptica e não é um array de
+   bits uniformemente distribuído; o `HKDF-Extract` com `salt` concentra essa entropia
+   em uma chave pseudoaleatória uniforme (`PRK`). Segundo, precisamos derivar duas
+   chaves independentes a partir do mesmo `Z_AB` (`Key_A2B` com `info="A2B"` e
+   `Key_B2A` com `info="B2A"`), o que o `HKDF-Expand` faz com segurança.
+
+P04. Por que derivamos duas chaves (`Key_A2B` e `Key_B2A`) em vez de uma única chave simétrica para o par?
+R: Porque a comunicação é bidirecional e assíncrona: tanto A quanto B começam seu
+   contador `seqSend` em `0`. Se ambos usassem a mesma chave e escolhessem (ou se um
+   atacante refletisse) o mesmo `IV_base`, haveria colisão de nonce ou ataque de
+   reflexão (reenviar para A um frame que o próprio A enviou). Com chaves distintas
+   por sentido (`PeerState.java::derive`), cada direção tem seu próprio espaço de nonces.
+
+P05. Como Alice e Bob escolhem o mesmo `salt` sem trocar mensagens diretas antes?
+R: Pela Decisão D2 (`PeerState.java::derive`): o servidor envia o `salt_srv` de cada
+   cliente dentro de `PEER_LIST` e `PEER_JOINED`. Alice e Bob comparam seus `client_id`
+   de 16 bytes como inteiros sem sinal (`Arrays.compareUnsigned` em `ClientId.java::compareTo`).
+   Ambos definem `A` como o menor ID e `B` como o maior ID, e ambos usam o `salt_srv`
+   de `A` no `HKDF-Extract`.
+
+P06. O que acontece se a chave privada RSA do servidor (`certs/server.p12`) vazar amanhã?
+R: Graças ao Forward Secrecy (ECDHE), o atacante que obtiver `server.p12` amanhã NÃO
+   conseguirá decifrar nenhuma conversa gravada hoje ou no passado. A chave RSA é usada
+   apenas para assinar o handshake no momento da conexão (`ServerHandshake.java`); todos
+   os segredos (`Z_ctrl` e `Z_AB`) vêm de chaves X25519 efêmeras geradas em RAM por
+   sessão e apagadas ao final.
+
+P07. Por que o contador `seqRecv` só é atualizado DEPOIS de validar a tag GCM?
+R: Regra de Ouro 5 (`PeerState.java::openMessage` e `Client.java::processControlFrame`):
+   se atualizássemos `seqRecv = frame.seqNo()` antes de verificar a tag GCM, um atacante
+   na rede poderia enviar um pacote falso com `seq_no = 999999` e lixo no ciphertext.
+   A tag falharia, mas se `seqRecv` tivesse avançado para `999999`, todas as mensagens
+   legítimas seguintes do remetente (`seq_no = 1, 2, ...`) seriam descartadas como
+   "replay", causando negação de serviço permanente naquela sessão.
+
+P08. O que é o AAD no AES-GCM e o que aconteceria se não o usássemos?
+R: O AAD (*Additional Authenticated Data*) são os 40 bytes do cabeçalho em claro do
+   frame E2E: `sender_id (16B) || recipient_id (16B) || seq_no (8B)` (`Messages.java::buildE2eAad`).
+   Ele não é cifrado (pois o servidor precisa ler `recipient_id` para rotear), mas entra
+   no cálculo da tag GCM (`cipher.updateAAD(aad)` em `AesGcm.java`). Sem o AAD, um
+   atacante ou o próprio servidor poderia adulterar o `sender_id` ou `seq_no` no
+   cabeçalho sem que o AES-GCM percebesse.
+
+P09. Como o JCA do Java 21 representa chaves públicas X25519 e qual é a armadilha?
+R: O protocolo exige 32 bytes raw em ordem little-endian (RFC 7748), mas o JCA
+   (`XECPublicKey` / `XECPublicKeySpec`) representa a coordenada `u` como um
+   `BigInteger` (que em Java é big-endian e pode ter sinal ou menos de 32 bytes).
+   Em `X25519Util.java`, nós limpamos o bit 255 (`raw[31] &= 0x7F`), invertemos a ordem
+   dos 32 bytes (`reverseCopy`) e usamos `new BigInteger(1, bigEndian)` para evitar
+   qualquer erro de sinal ou tamanho.
+
+P10. Por que criamos uma nova instância de `Cipher.getInstance("AES/GCM/NoPadding")` a cada mensagem?
+R: Em `AesGcm.java`, instanciamos um `Cipher` novo por operação porque: (1) `Cipher`
+   não é thread-safe, e temos virtual threads concorrentes; (2) o provedor SunJCE do
+   JDK proíbe reinicializar a mesma instância de `Cipher` em modo `ENCRYPT_MODE` com
+   o mesmo par chave+IV e mantém estado interno entre chamadas. Criar por operação é
+   barato e elimina qualquer risco de reuso acidental de estado.
+
+P11. Por que o servidor usa `ReentrantLock` em vez de `synchronized` para escrever nos sockets?
+R: Porque o servidor usa virtual threads do Java 21 (`Executors.newVirtualThreadPerTaskExecutor()`
+   em `Server.java`). Em Java 21, bloquear em I/O de rede (`SocketOutputStream.write`)
+   dentro de um bloco `synchronized` causa *pinning* da plataforma thread subjacente,
+   reduzindo a escalabilidade. Com `ReentrantLock` (`Session.java`), a virtual thread
+   pode ser desmontada livremente durante o I/O.
+
+P12. O que impede um cliente malicioso de derrubar o servidor com `OutOfMemoryError` enviando um tamanho gigante no frame TCP?
+R: Em `Framing.java::readFrame`, antes de executar `new byte[payloadLen]`, o código
+   verifica `if (length <= 0 || length > Constants.MAX_FRAME)` (onde `MAX_FRAME = 8192`).
+   Se o tamanho declarado for inválido (como `-42` no `TamperProxy` modo `BADFRAME` ou
+   `2 GB`), uma `FramingException` é lançada imediatamente sem alocar o array, e
+   `ClientConnection` fecha apenas o socket daquele infrator.
+
+P13. Como o sistema lida com um cliente que tenta se conectar usando o `client_id` de outro cliente já ativo?
+R: Pela Decisão D4 (`SessionRegistry.java::register` com `putIfAbsent` e
+   `ClientConnection.java::run`), o servidor detecta que já existe uma sessão ativa para
+   aquele `client_id`, envia `CONTROL(ERROR, ERR_DUPLICATE_CLIENT_ID)` cifrado com a
+   `Key_S2C` da nova conexão e fecha a nova conexão. No bloco `finally`, usa
+   `registry.removeIfSame(id, session)` (`ConcurrentHashMap.remove(key, value)`) para
+   garantir que a sessão original legítima jamais seja removida.
+
+P14. Como garantimos que nenhuma chave, nonce ou conteúdo de mensagem vaze nos logs?
+R: Centralizamos todo log na classe `SecureLog.java`, que possui apenas métodos tipados
+   (`connected`, `disconnected`, `rejected`, `routed`, `info`, `warn`, `error`) e nenhum
+   método público que aceite `byte[]`. Além disso, o teste automatizado
+   `RobustnessAndLogPolicyTest::testSourceCodeLogPolicyAudit` varre todo o diretório
+   `src/` garantindo que `System.out`, `System.err`, `printStackTrace` e `Logger` não
+   sejam usados fora de `SecureLog.java` e `Cli.java`.
+
+--------------------------------------------------------------------------------
+16. CHANGELOG
+--------------------------------------------------------------------------------
+- [T00] Criado o esqueleto inicial do documento com todas as 16 seções obrigatórias,
+  glossário base, constantes de `securechat.common.Constants` e estrutura de testes
+  (`Assert` e `TestRunner`).
+- [T01] Documentados o framing TCP (`Framing`, `FramingException`, `ProtocolException`),
+  o wrapper imutável `ClientId` (com `Arrays.compareUnsigned`), utilitários `Bytes` e a
+  política de log tipado em `SecureLog`.
+- [T02] Documentadas as primitivas criptográficas em `X25519Util` (conversão raw 32 B
+  little-endian e ECDH), `Hkdf` (Extract/Expand manual RFC 5869), `AesGcm` (AEAD com
+  Cipher novo por operação), `RsaPss` (parâmetros fixos D6) e `Messages.handshakeHash`.
+- [T03] Documentado o gerenciamento de identidade RSA do servidor (`certs/server.p12`) e
+  o pinning do certificado DER (`certs/server.crt`) em `securechat.common.CertUtil`.
+- [T04] Detalhados os formatos binários e empacotamento manual (`ByteBuffer`) de `HELLO`,
+  `HELLO_REPLY`, `CONTROL` (5 opcodes selados) e `E2E` em `securechat.common.Messages`.
+- [T05] Documentado o fluxo completo de handshake em `ServerHandshake` e `ClientHandshake`
+  (ECDHE X25519, assinatura RSA-PSS sobre `H`, pinning D7, derivação de `Key_S2C` e timeouts).
+- [T06] Documentadas as estruturas e classes do servidor (`Session`, `SessionRegistry`,
+  `ClientConnection` e `Server`), o canal de controle sob `writeLock` e a rejeição D4.
+- [T07] Documentada a derivação de chaves E2E (`PeerState`, `PeerTable`, `Client`),
+  a escolha canônica A/B + salt D2, substituição em reconexão e anti-replay de controle.
+- [T08] Documentado o fluxo completo de envio, relay cego e recebimento E2E (`Cli`,
+  `Client`, `PeerState`), validações D3, limite de 4096 B e erro de destinatário ausente.
+- [T09] Documentados os 4 modos do `TamperProxy` (`sniff`, `bitflip`, `replay`, `badframe`),
+  as 5 garantias de segurança (seção 11) e a tabela completa dos 10 cenários obrigatórios
+  de segurança verificados por `SecurityTests` (seção 12).
+- [T10] Documentadas a robustez contra tráfego aleatório/EOF/malformado, a imposição de
+  `MAX_CLIENTS` com recuperação de vaga e a auditoria estática da política de logs em
+  `RobustnessAndLogPolicyTest` (seções 10, 11, 12 e 16).
+- [T11] Documentados o `DemoScenarioRunner` e os scripts de demonstração ao vivo
+  (`scripts/demo-e2e`, `demo-bitflip`, `demo-replay`, `demo-badframe`, `demo-all`) nas
+  seções 10, 12 e 16, além da atualização completa do `README.md`.
+- [T12] Fechamento completo da documentação explicativa: revisão de consistência do
+  mapa do código (seção 10), detalhamento das decisões D1–D7 e limitações incluindo
+  `PrivateKey` do JCA (seção 13), roteiro de apresentação para 4 integrantes (seção 14)
+  e 14 perguntas e respostas prováveis do professor (seção 15).
+
+
+
+
+

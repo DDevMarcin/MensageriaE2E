@@ -37,10 +37,10 @@ Em Java, **pacote = pasta**: `src/securechat/common/Hkdf.java` começa com `pack
 ## 2. Pacotes e classes sugeridas
 | Pacote | Responsabilidade | Classes sugeridas | Task |
 |---|---|---|---|
-| `securechat.common` | Tudo que cliente **e** servidor usam: constantes, bytes, framing, primitivas criptográficas, formato das mensagens, log | `Constants`, `ClientId`, `Bytes`, `Framing`, `FramingException`, `ProtocolException`, `X25519Util`, `Hkdf`, `AesGcm`, `RsaPss`, `Messages`, `SecureLog` | T01, T02, T04 |
+| `securechat.common` | Tudo que cliente **e** servidor usam: constantes, bytes, framing, primitivas criptográficas, certificados, formato das mensagens, log | `Constants`, `ClientId`, `Bytes`, `Framing`, `FramingException`, `ProtocolException`, `X25519Util`, `Hkdf`, `AesGcm`, `RsaPss`, `CertUtil`, `Messages`, `SecureLog` | T01, T02, T03, T04 |
 | `securechat.server` | Aceitar conexões, handshake do lado servidor, registrar sessões, rotear frames, canal de controle | `Server`, `ServerHandshake`, `ClientConnection`, `Session`, `SessionRegistry` | T03, T05, T06 |
 | `securechat.client` | Handshake do lado cliente, tabela de peers, derivação E2E, envio/recebimento, CLI | `Client`, `ClientHandshake`, `PeerState`, `PeerTable`, `Cli` | T05, T07, T08 |
-| `securechat.tools` | Utilitários de demonstração e teste (não fazem parte do protocolo) | `TamperProxy` | T09 |
+| `securechat.tools` | Utilitários de demonstração e teste (não fazem parte do protocolo) | `TamperProxy`, `DemoScenarioRunner` | T09, T11 |
 | `test/securechat` | Testes automatizados e runner próprio | `TestRunner`, `Assert`, `...Test` por classe | todas |
 
 ## 3. Direção das dependências (quem pode usar quem)
