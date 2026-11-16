@@ -254,4 +254,3 @@ Caso queira demonstrar todos os cenários acima de forma automática durante a a
 .\scripts\demo-replay.bat
 .\scripts\demo-badframe.bat
 ```
-
